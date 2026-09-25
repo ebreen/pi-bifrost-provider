@@ -253,29 +253,22 @@ export function normalizeModelKey(id: string): string {
 }
 
 /**
- * Keys to try for one Bifrost model id. Bifrost prefixes IDs with its gateway
- * provider (`CommandCode/claude-opus-5-5`) while a catalog keys the same model
- * under the bare name (`claude-opus-5-5`), so trailing path segments are tried
- * as well.
+ * Bucket key for a registry id: the last path segment, tag- and date-normalized.
+ *
+ * Gateways spell the same model differently (`minimax-m3`, `minimaxai/minimax-m3`,
+ * `CommandCode/MiniMaxAI/MiniMax-M3`) and each spelling is its own registry entry. Keying by
+ * spelling lets a lone provider outvote the twelve behind another spelling, so every variant
+ * votes in one bucket.
  */
-function lookupKeys(id: string): string[] {
-	const normalized = normalizeModelKey(id);
-	const segments = normalized.split("/");
-	const keys = [normalized];
-	for (let offset = 1; offset < segments.length && offset <= 2; offset += 1) {
-		keys.push(segments.slice(offset).join("/"));
-	}
-	return keys;
+export function modelKey(id: string): string {
+	const segments = normalizeModelKey(id).split("/");
+	return segments[segments.length - 1] ?? "";
 }
 
 /** Resolve limits for a Bifrost model id, or `undefined` when unknown. */
 export function metadataFor(index: ModelMetadataIndex | undefined, modelId: string): ModelMetadata | undefined {
 	if (!index) return undefined;
-	for (const key of lookupKeys(modelId)) {
-		const metadata = index.get(key);
-		if (metadata) return metadata;
-	}
-	return undefined;
+	return index.get(modelKey(modelId));
 }
 
 /**
@@ -284,9 +277,22 @@ export function metadataFor(index: ModelMetadataIndex | undefined, modelId: stri
  * The first provider to define a model id wins: catalogs repeat the same
  * limits across gateways, and a stable choice beats a clever one.
  */
+/**
+ * Build a lookup from a models.dev `api.json` document, or from any object
+ * shaped `{ provider: { models: { id: { limit: { context, output } } } } }`.
+ *
+ * Catalogs list the same model once per gateway, and gateways report different
+ * limits: a router that clips a window reports less than the model's own vendor
+ * (gpt-5.4: one provider 400k, eight 1.05M; kimi-k3: mostly 1M+, one 262k).
+ * Taking the first provider to define an id therefore reports whichever gateway
+ * happens to come first — an under-report, which Pi answers by compacting
+ * needlessly early. The majority value wins instead, for both the window and
+ * the output cap, and ties go to the larger value (limits are clipped far more
+ * often than they are inflated).
+ */
 export function buildMetadataIndex(catalog: unknown): ModelMetadataIndex {
-	const index: ModelMetadataIndex = new Map();
-	if (!catalog || typeof catalog !== "object") return index;
+	const candidates = new Map<string, ModelMetadata[]>();
+	if (!catalog || typeof catalog !== "object") return new Map();
 	for (const provider of Object.values(catalog as Record<string, unknown>)) {
 		const models = (provider as { models?: Record<string, unknown> } | undefined)?.models;
 		if (!models || typeof models !== "object") continue;
@@ -295,11 +301,48 @@ export function buildMetadataIndex(catalog: unknown): ModelMetadataIndex {
 			const contextWindow = positiveInteger(limit?.context);
 			const maxTokens = positiveInteger(limit?.output);
 			if (contextWindow === undefined && maxTokens === undefined) continue;
-			const key = normalizeModelKey(id);
-			if (!index.has(key)) index.set(key, { contextWindow, maxTokens });
+			const key = modelKey(id);
+			if (!key) continue;
+			const existing = candidates.get(key);
+			if (existing) existing.push({ contextWindow, maxTokens });
+			else candidates.set(key, [{ contextWindow, maxTokens }]);
 		}
 	}
+
+	const index: ModelMetadataIndex = new Map();
+	for (const [key, entries] of candidates) {
+		const contextWindow = majorityValue(entries.map((entry) => entry.contextWindow));
+		if (contextWindow === undefined) {
+			index.set(key, { maxTokens: majorityValue(entries.map((entry) => entry.maxTokens)) });
+			continue;
+		}
+		// Output caps belong to the window they were reported with; mixing them across windows would
+		// let a bigger window's cap through.
+		const maxTokens = majorityValue(
+			entries.filter((entry) => entry.contextWindow === contextWindow).map((entry) => entry.maxTokens),
+		);
+		index.set(key, { contextWindow, maxTokens });
+	}
 	return index;
+}
+
+/** Most-reported value, ties to the larger one. */
+function majorityValue(values: readonly (number | undefined)[]): number | undefined {
+	const votes = new Map<number, number>();
+	for (const value of values) {
+		if (value === undefined) continue;
+		votes.set(value, (votes.get(value) ?? 0) + 1);
+	}
+	let winner: number | undefined;
+	for (const [value, count] of votes) {
+		if (winner === undefined) {
+			winner = value;
+			continue;
+		}
+		const winnerCount = votes.get(winner) ?? 0;
+		if (count > winnerCount || (count === winnerCount && value > winner)) winner = value;
+	}
+	return winner;
 }
 
 function isFresh(checkedAt: unknown, now: number): boolean {

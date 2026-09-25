@@ -361,7 +361,7 @@ test("surfaces Bifrost model discovery errors", async () => {
 /** Shape-compatible subset of models.dev `api.json`. */
 const CATALOG = {
 	anthropic: { models: { "claude-opus-5-5": { limit: { context: 1_000_000, output: 128_000 } } } },
-	// A later provider repeating the same id must not win over the first one.
+	// A gateway that clips the window must not win over the two providers that agree.
 	openrouter: { models: { "claude-opus-5-5": { limit: { context: 200_000, output: 64_000 } } } },
 	deepseek: { models: { "deepseek-v4.1-flash": { limit: { context: 1_000_000 } } } },
 };
@@ -385,6 +385,30 @@ test("normalizes catalog keys across Bifrost prefixes, tags, and dates", () => {
 	assert.equal(normalizeModelKey(" CommandCode/Claude-Opus-5-5 "), "commandcode/claude-opus-5-5");
 	assert.equal(normalizeModelKey("poolside/laguna-s-2.1:free"), "poolside/laguna-s-2.1");
 	assert.equal(normalizeModelKey("claude-opus-4-5-20251101"), "claude-opus-4-5");
+});
+
+test("takes the most-reported window, not whichever provider comes first", () => {
+	const majority = buildMetadataIndex({
+		abacus: { models: { "gpt-5.4": { limit: { context: 400_000, output: 128_000 } } } },
+		azure: { models: { "gpt-5.4": { limit: { context: 1_050_000, output: 128_000 } } } },
+		"302ai": { models: { "gpt-5.4": { limit: { context: 1_050_000, output: 64_000 } } } },
+		freemodel: { models: { "gpt-5.4": { limit: { context: 1_050_000, output: 32_000 } } } },
+		// 2-2 on the window: the tie must resolve to the larger one.
+		other: { models: { "tie-model": { limit: { context: 1_048_576 } } } },
+		third: { models: { "tie-model": { limit: { context: 262_144 } } } },
+		// One provider spells the id with a vendor prefix and claims a 1M output cap; the twelve
+		// behind the bare spelling say 512k, and both spellings must vote in one bucket.
+		minimax: { models: { "minimax-m3": { limit: { context: 1_048_576, output: 512_000 } } } },
+		"minimax-cn": { models: { "minimax-m3": { limit: { context: 1_048_576, output: 512_000 } } } },
+		"outlier-host": { models: { "minimaxai/minimax-m3": { limit: { context: 1_048_576, output: 1_048_576 } } } },
+	});
+	assert.deepEqual(metadataFor(majority, "gpt-5.4"), { contextWindow: 1_050_000, maxTokens: 128_000 });
+	assert.deepEqual(metadataFor(majority, "tie-model"), { contextWindow: 1_048_576, maxTokens: undefined });
+	assert.deepEqual(metadataFor(majority, "minimax-m3"), { contextWindow: 1_048_576, maxTokens: 512_000 });
+	assert.deepEqual(metadataFor(majority, "CommandCode/MiniMaxAI/MiniMax-M3"), {
+		contextWindow: 1_048_576,
+		maxTokens: 512_000,
+	});
 });
 
 test("resolves limits through gateway and vendor path segments", () => {
